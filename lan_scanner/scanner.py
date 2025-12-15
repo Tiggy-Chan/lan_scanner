@@ -1,11 +1,12 @@
 """
 局域网设备扫描器 - 扫描模块
 
-使用 nmap 提供网络扫描功能。
+使用 nmap 提供网络扫描功能，支持并行扫描以提高速度。
 """
 
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Optional
 
 import nmap
@@ -34,19 +35,25 @@ class Scanner:
     Attributes:
         subnet: 目标子网 (CIDR 格式，如 '192.168.1.0/24')
         _scanner: 内部 nmap.PortScanner 实例
+        max_workers: 并行扫描的最大线程数
     """
     
-    def __init__(self, subnet: str):
+    # 默认并行线程数
+    DEFAULT_WORKERS = 50
+    
+    def __init__(self, subnet: str, max_workers: int = None):
         """使用目标子网初始化扫描器。
         
         Args:
             subnet: 目标子网 (CIDR 格式，如 '192.168.1.0/24')
+            max_workers: 并行扫描的最大线程数，默认 50
             
         Raises:
             NmapNotFoundError: 系统未安装 nmap
             PrivilegeError: 需要管理员权限但未获得
         """
         self.subnet = subnet
+        self.max_workers = max_workers or self.DEFAULT_WORKERS
         self._scanner = None
         
         # 检查 nmap 是否可用
@@ -83,6 +90,7 @@ class Scanner:
         """使用 ping 扫描发现网络上的活跃主机。
         
         使用 nmap 的 -sn (ping 扫描) 快速发现主机，不进行端口扫描。
+        使用 -T5 最激进时序和 --min-parallelism 提高速度。
         
         Returns:
             List[str]: 活跃主机的 IP 地址列表
@@ -92,7 +100,13 @@ class Scanner:
         """
         try:
             # -sn: Ping 扫描 - 禁用端口扫描
-            self._scanner.scan(hosts=self.subnet, arguments='-sn')
+            # -T5: 最激进时序 (insane)
+            # --min-parallelism 100: 最小并行探测数
+            # --max-retries 1: 减少重试次数
+            self._scanner.scan(
+                hosts=self.subnet, 
+                arguments='-sn -T5 --min-parallelism 100 --max-retries 1'
+            )
             
             # 获取所有在线主机
             active_hosts = []
@@ -120,33 +134,49 @@ class Scanner:
         Raises:
             ScannerError: 扫描失败时抛出
         """
+        # 每个线程需要独立的 scanner 实例
+        scanner = nmap.PortScanner()
+        
         try:
-            # 扫描参数:
+            # 扫描参数 (优化速度):
             # -sS: TCP SYN 扫描 (需要 root)
-            # -sV: 服务版本检测
-            # -O: 操作系统检测 (需要 root)
-            # -T4: 激进时序
-            # --top-ports 100: 扫描前 100 个常用端口
+            # -T5: 最激进时序
+            # --top-ports 20: 只扫描前 20 个常用端口 (大幅减少时间)
+            # --max-retries 1: 减少重试
+            # --host-timeout 30s: 单主机超时 30 秒
+            # -O --osscan-limit: 操作系统检测，但限制只对有开放端口的主机
             
             # 检查是否有 root 权限以进行高级扫描
             if self.check_privileges():
-                arguments = '-sS -sV -O -T4 --top-ports 100'
+                arguments = '-sS -T5 --top-ports 20 --max-retries 1 --host-timeout 30s -O --osscan-limit'
             else:
                 # 回退到 TCP 连接扫描，不进行操作系统检测
-                arguments = '-sT -sV -T4 --top-ports 100'
+                arguments = '-sT -T5 --top-ports 20 --max-retries 1 --host-timeout 30s'
             
-            self._scanner.scan(hosts=ip, arguments=arguments)
+            scanner.scan(hosts=ip, arguments=arguments)
             
             # 提取设备信息
-            return self._parse_device_info(ip)
+            return self._parse_device_info_from_scanner(scanner, ip)
             
         except nmap.PortScannerError as e:
             raise ScannerError(f"设备扫描失败 {ip}: {e}")
 
     def _parse_device_info(self, ip: str) -> DeviceInfo:
+        """将 nmap 扫描结果解析为 DeviceInfo 对象 (使用实例 scanner)。
+        
+        Args:
+            ip: 被扫描设备的 IP 地址
+            
+        Returns:
+            DeviceInfo: 解析后的设备信息
+        """
+        return self._parse_device_info_from_scanner(self._scanner, ip)
+    
+    def _parse_device_info_from_scanner(self, scanner: nmap.PortScanner, ip: str) -> DeviceInfo:
         """将 nmap 扫描结果解析为 DeviceInfo 对象。
         
         Args:
+            scanner: nmap.PortScanner 实例
             ip: 被扫描设备的 IP 地址
             
         Returns:
@@ -161,10 +191,10 @@ class Scanner:
         open_ports = []
         
         # 检查主机是否在扫描结果中
-        if ip not in self._scanner.all_hosts():
+        if ip not in scanner.all_hosts():
             return DeviceInfo(ip=ip)
         
-        host_info = self._scanner[ip]
+        host_info = scanner[ip]
         
         # 提取 MAC 地址和厂商
         if 'addresses' in host_info:
@@ -254,6 +284,56 @@ class Scanner:
                 devices.append(DeviceInfo(ip=ip))
         
         return devices
+    
+    def scan_devices_parallel(
+        self, 
+        hosts: List[str], 
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> List[DeviceInfo]:
+        """并行扫描多个主机。
+        
+        使用线程池并行扫描，大幅提高扫描速度。
+        
+        Args:
+            hosts: 要扫描的主机 IP 列表
+            progress_callback: 可选的回调函数，每完成一台设备时调用。
+                              签名: callback(completed: int, total: int, ip: str)
+                              
+        Returns:
+            List[DeviceInfo]: 所有主机的设备信息列表
+        """
+        total = len(hosts)
+        results = {}
+        completed = 0
+        
+        def scan_single(ip: str) -> DeviceInfo:
+            """扫描单个主机的包装函数。"""
+            try:
+                return self.scan_device(ip)
+            except ScannerError:
+                return DeviceInfo(ip=ip)
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # 提交所有扫描任务
+            future_to_ip = {executor.submit(scan_single, ip): ip for ip in hosts}
+            
+            # 收集结果
+            for future in as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                completed += 1
+                
+                try:
+                    device_info = future.result()
+                    results[ip] = device_info
+                except Exception:
+                    results[ip] = DeviceInfo(ip=ip)
+                
+                # 调用进度回调
+                if progress_callback:
+                    progress_callback(completed, total, ip)
+        
+        # 按原始顺序返回结果
+        return [results.get(ip, DeviceInfo(ip=ip)) for ip in hosts]
 
 
 def parse_nmap_output(scan_result: dict, ip: str) -> DeviceInfo:

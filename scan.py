@@ -73,6 +73,13 @@ def parse_args() -> argparse.Namespace:
     )
     
     parser.add_argument(
+        '-w', '--workers',
+        type=int,
+        default=50,
+        help='并行扫描线程数，默认: 50，可根据网络情况调整'
+    )
+    
+    parser.add_argument(
         '-q', '--quiet',
         action='store_true',
         help='静默模式，不显示进度'
@@ -163,7 +170,7 @@ def handle_interrupt(signum, frame):
     sys.exit(130)  # Ctrl+C 的标准退出码
 
 
-def run_scan(interface: Optional[str], subnets: Optional[List[str]], output_file: Optional[str], quiet: bool = False) -> int:
+def run_scan(interface: Optional[str], subnets: Optional[List[str]], output_file: Optional[str], quiet: bool = False, workers: int = 50) -> int:
     """执行扫描流程。
     
     Args:
@@ -171,6 +178,7 @@ def run_scan(interface: Optional[str], subnets: Optional[List[str]], output_file
         subnets: 要扫描的子网列表 (None 表示从接口自动检测)
         output_file: 输出文件路径 (None 表示自动生成)
         quiet: 如果为 True，不显示进度输出
+        workers: 并行扫描线程数
         
     Returns:
         int: 退出码 (0 表示成功，非零表示错误)
@@ -223,14 +231,14 @@ def run_scan(interface: Optional[str], subnets: Optional[List[str]], output_file
         
         # 步骤 3: 初始化扫描器并发现所有子网中的主机
         if not quiet:
-            print("\n🚀 正在初始化扫描器...")
+            print(f"\n🚀 正在初始化扫描器 (并行线程数: {workers})...")
         
         all_active_hosts = []
         first_scanner = None
         
         for subnet in subnets_to_scan:
             try:
-                scanner = Scanner(subnet)
+                scanner = Scanner(subnet, max_workers=workers)
                 if first_scanner is None:
                     first_scanner = scanner
                     
@@ -284,27 +292,27 @@ def run_scan(interface: Optional[str], subnets: Optional[List[str]], output_file
                 report.print_to_stdout()
             return 0
         
-        # 步骤 6: 扫描每台设备
+        # 步骤 6: 并行扫描每台设备
         if not quiet:
-            print(f"\n🔬 正在扫描 {host_count} 台设备...\n")
-        
-        # 非静默模式使用进度回调
-        callback = progress_callback if not quiet else None
+            print(f"\n🔬 正在并行扫描 {host_count} 台设备 ({workers} 线程)...\n")
         
         # 使用第一个扫描器进行设备扫描
         scanner = first_scanner
         
-        _current_devices = []
-        for i, host_ip in enumerate(all_active_hosts, 1):
-            if callback:
-                callback(i, host_count, host_ip)
-            
-            try:
-                device_info = scanner.scan_device(host_ip)
-                _current_devices.append(device_info)
-            except ScannerError:
-                # 扫描失败时添加最小信息
-                _current_devices.append(DeviceInfo(ip=host_ip))
+        # 并行扫描进度回调
+        def parallel_progress(completed: int, total: int, ip: str):
+            if not quiet:
+                percentage = (completed / total) * 100 if total > 0 else 0
+                bar_length = 30
+                filled = int(bar_length * completed / total) if total > 0 else 0
+                bar = '█' * filled + '░' * (bar_length - filled)
+                print(f"\r[{bar}] {percentage:5.1f}% ({completed}/{total}) 已完成: {ip:<15}", end='', flush=True)
+        
+        # 使用并行扫描
+        _current_devices = scanner.scan_devices_parallel(
+            all_active_hosts, 
+            progress_callback=parallel_progress if not quiet else None
+        )
         
         if not quiet:
             print("\n")  # 进度条后换行
@@ -372,7 +380,8 @@ def main() -> int:
         interface=args.interface,
         subnets=args.subnet,
         output_file=args.output,
-        quiet=args.quiet
+        quiet=args.quiet,
+        workers=args.workers
     )
 
 

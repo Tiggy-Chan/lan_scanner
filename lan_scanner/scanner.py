@@ -4,10 +4,11 @@
 使用 nmap 提供网络扫描功能，支持并行扫描以提高速度。
 """
 
+import ipaddress
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import nmap
 
@@ -86,11 +87,78 @@ class Scanner:
         """
         return os.geteuid() == 0
     
-    def discover_hosts(self) -> List[str]:
-        """使用 ping 扫描发现网络上的活跃主机。
+    def _split_subnet(self, subnet: str, max_size: int = 256) -> List[str]:
+        """将大网段拆分成多个小网段。
         
-        使用 nmap 的 -sn (ping 扫描) 快速发现主机，不进行端口扫描。
-        使用 -T5 最激进时序和 --min-parallelism 提高速度。
+        Args:
+            subnet: CIDR 格式的子网 (如 '192.168.0.0/23')
+            max_size: 每个子网段的最大 IP 数量
+            
+        Returns:
+            List[str]: 拆分后的子网列表
+        """
+        try:
+            network = ipaddress.ip_network(subnet, strict=False)
+            total_hosts = network.num_addresses
+            
+            # 如果网段足够小，不需要拆分
+            if total_hosts <= max_size:
+                return [subnet]
+            
+            # 计算需要拆分成多少个 /24
+            subnets = []
+            if network.prefixlen < 24:
+                # 拆分成 /24 网段
+                for sub in network.subnets(new_prefix=24):
+                    subnets.append(str(sub))
+            else:
+                subnets.append(subnet)
+            
+            return subnets
+        except ValueError:
+            return [subnet]
+    
+    def _discover_hosts_single(self, subnet: str) -> List[str]:
+        """扫描单个子网段的活跃主机。
+        
+        Args:
+            subnet: 要扫描的子网
+            
+        Returns:
+            List[str]: 活跃主机列表
+        """
+        scanner = nmap.PortScanner()
+        try:
+            # -sn: Ping 扫描
+            # -T5: 最激进时序
+            # --min-parallelism 256: 最大并行
+            # --max-retries 1: 减少重试
+            # --max-rtt-timeout 100ms: 减少超时等待
+            scanner.scan(
+                hosts=subnet,
+                arguments='-sn -T5 --min-parallelism 256 --max-retries 1 --max-rtt-timeout 100ms'
+            )
+            
+            active_hosts = []
+            for host in scanner.all_hosts():
+                if scanner[host].state() == 'up':
+                    active_hosts.append(host)
+            
+            return active_hosts
+        except nmap.PortScannerError:
+            return []
+    
+    def discover_hosts(
+        self, 
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> List[str]:
+        """使用并行 ping 扫描发现网络上的活跃主机。
+        
+        将大网段拆分成多个 /24，并行扫描以提高速度并显示进度。
+        
+        Args:
+            progress_callback: 可选的进度回调函数
+                              签名: callback(completed: int, total: int, subnet: str)
         
         Returns:
             List[str]: 活跃主机的 IP 地址列表
@@ -99,24 +167,48 @@ class Scanner:
             ScannerError: 扫描失败时抛出
         """
         try:
-            # -sn: Ping 扫描 - 禁用端口扫描
-            # -T5: 最激进时序 (insane)
-            # --min-parallelism 100: 最小并行探测数
-            # --max-retries 1: 减少重试次数
-            self._scanner.scan(
-                hosts=self.subnet, 
-                arguments='-sn -T5 --min-parallelism 100 --max-retries 1'
-            )
+            # 拆分网段
+            subnets = self._split_subnet(self.subnet)
+            total_subnets = len(subnets)
             
-            # 获取所有在线主机
-            active_hosts = []
-            for host in self._scanner.all_hosts():
-                if self._scanner[host].state() == 'up':
-                    active_hosts.append(host)
+            # 如果只有一个子网，直接扫描
+            if total_subnets == 1:
+                if progress_callback:
+                    progress_callback(0, 1, subnets[0])
+                hosts = self._discover_hosts_single(subnets[0])
+                if progress_callback:
+                    progress_callback(1, 1, subnets[0])
+                return hosts
             
-            return active_hosts
+            # 多个子网，并行扫描
+            all_hosts = []
+            completed = 0
             
-        except nmap.PortScannerError as e:
+            # 使用线程池并行扫描各子网
+            with ThreadPoolExecutor(max_workers=min(total_subnets, 8)) as executor:
+                future_to_subnet = {
+                    executor.submit(self._discover_hosts_single, subnet): subnet 
+                    for subnet in subnets
+                }
+                
+                for future in as_completed(future_to_subnet):
+                    subnet = future_to_subnet[future]
+                    completed += 1
+                    
+                    try:
+                        hosts = future.result()
+                        all_hosts.extend(hosts)
+                    except Exception:
+                        pass
+                    
+                    if progress_callback:
+                        progress_callback(completed, total_subnets, subnet)
+            
+            # 排序 IP 地址
+            all_hosts.sort(key=lambda ip: tuple(map(int, ip.split('.'))))
+            return all_hosts
+            
+        except Exception as e:
             raise ScannerError(f"主机发现失败: {e}")
     
     def scan_device(self, ip: str) -> DeviceInfo:

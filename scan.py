@@ -251,13 +251,23 @@ def run_scan(interface: Optional[str], subnets: Optional[List[str]], output_file
                         if not quiet:
                             print("   已获得管理员权限 ✓")
                 
-                # 步骤 5: 发现主机
+                # 步骤 5: 发现主机 (带进度显示)
                 if not quiet:
                     print(f"\n📡 正在发现 {subnet} 上的主机...")
                 
-                active_hosts = scanner.discover_hosts()
+                # 主机发现进度回调
+                def discovery_progress(completed: int, total: int, current_subnet: str):
+                    if not quiet and total > 1:
+                        percentage = (completed / total) * 100
+                        bar_length = 20
+                        filled = int(bar_length * completed / total)
+                        bar = '█' * filled + '░' * (bar_length - filled)
+                        print(f"\r   [{bar}] {percentage:5.1f}% ({completed}/{total}) {current_subnet}", end='', flush=True)
+                
+                active_hosts = scanner.discover_hosts(progress_callback=discovery_progress if not quiet else None)
+                
                 if not quiet:
-                    print(f"   发现 {len(active_hosts)} 台活跃主机")
+                    print(f"\r   发现 {len(active_hosts)} 台活跃主机" + " " * 40)
                 all_active_hosts.extend(active_hosts)
                 
             except NmapNotFoundError as e:

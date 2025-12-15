@@ -138,20 +138,22 @@ class Scanner:
         scanner = nmap.PortScanner()
         
         try:
-            # 扫描参数 (优化速度):
+            # 扫描参数 (平衡速度与准确性):
             # -sS: TCP SYN 扫描 (需要 root)
-            # -T5: 最激进时序
-            # --top-ports 20: 只扫描前 20 个常用端口 (大幅减少时间)
-            # --max-retries 1: 减少重试
-            # --host-timeout 30s: 单主机超时 30 秒
-            # -O --osscan-limit: 操作系统检测，但限制只对有开放端口的主机
+            # -sV: 服务版本检测 (帮助识别更多信息)
+            # -T4: 激进时序 (比 T5 稍慢但更可靠)
+            # --top-ports 50: 扫描前 50 个常用端口 (平衡覆盖率和速度)
+            # --max-retries 2: 适当重试以提高准确性
+            # --host-timeout 45s: 单主机超时 45 秒
+            # -O --osscan-guess: 操作系统检测，即使不确定也给出猜测
+            # --version-intensity 2: 版本检测强度 (0-9，2 是快速但有效)
             
             # 检查是否有 root 权限以进行高级扫描
             if self.check_privileges():
-                arguments = '-sS -T5 --top-ports 20 --max-retries 1 --host-timeout 30s -O --osscan-limit'
+                arguments = '-sS -sV -T4 --top-ports 50 --max-retries 2 --host-timeout 45s -O --osscan-guess --version-intensity 2'
             else:
                 # 回退到 TCP 连接扫描，不进行操作系统检测
-                arguments = '-sT -T5 --top-ports 20 --max-retries 1 --host-timeout 30s'
+                arguments = '-sT -sV -T4 --top-ports 50 --max-retries 2 --host-timeout 45s --version-intensity 2'
             
             scanner.scan(hosts=ip, arguments=arguments)
             
@@ -196,17 +198,17 @@ class Scanner:
         
         host_info = scanner[ip]
         
-        # 提取 MAC 地址和厂商
+        # 提取 MAC 地址
         if 'addresses' in host_info:
             mac = host_info['addresses'].get('mac', '未知')
         
+        # 提取厂商 (多种来源)
         if 'vendor' in host_info and host_info['vendor']:
-            # vendor 是一个字典 {mac: vendor_name}
             vendor_dict = host_info['vendor']
             if vendor_dict:
                 vendor = list(vendor_dict.values())[0]
         
-        # 提取主机名
+        # 提取主机名 (多种来源)
         if 'hostnames' in host_info and host_info['hostnames']:
             for hostname_entry in host_info['hostnames']:
                 name = hostname_entry.get('name', '')
@@ -214,33 +216,72 @@ class Scanner:
                     hostname = name
                     break
         
-        # 提取操作系统信息
+        # 提取操作系统信息 (多种来源)
+        # 1. 首先尝试 osmatch
         if 'osmatch' in host_info and host_info['osmatch']:
-            # 获取最佳匹配的操作系统
             best_match = host_info['osmatch'][0]
-            os_info = best_match.get('name', '未知')
+            os_name = best_match.get('name', '')
+            if os_name:
+                os_info = os_name
         
-        # 提取延迟
+        # 2. 如果 osmatch 没有，尝试 osclass
+        if os_info == "未知" and 'osclass' in host_info and host_info['osclass']:
+            osclass = host_info['osclass'][0]
+            os_family = osclass.get('osfamily', '')
+            os_gen = osclass.get('osgen', '')
+            if os_family:
+                os_info = f"{os_family} {os_gen}".strip()
+        
+        # 3. 尝试从服务版本推断操作系统
+        if os_info == "未知":
+            os_hints = []
+            for proto in ['tcp', 'udp']:
+                if proto in host_info:
+                    for port, port_data in host_info[proto].items():
+                        extrainfo = port_data.get('extrainfo', '')
+                        product = port_data.get('product', '')
+                        # 从服务信息推断 OS
+                        if 'Windows' in extrainfo or 'Windows' in product:
+                            os_hints.append('Windows')
+                        elif 'Ubuntu' in extrainfo or 'Debian' in extrainfo:
+                            os_hints.append('Linux')
+                        elif 'Linux' in extrainfo:
+                            os_hints.append('Linux')
+            if os_hints:
+                os_info = os_hints[0]
+        
+        # 提取延迟 (多种来源)
+        # 1. 从 status 获取 TTL
         if 'status' in host_info:
             reason_ttl = host_info['status'].get('reason_ttl', '')
             if reason_ttl:
                 latency = f"TTL: {reason_ttl}"
         
-        # 尝试从 tcp/udp 扫描结果获取实际延迟
-        for proto in ['tcp', 'udp']:
-            if proto in host_info:
-                # 延迟可能在主机信息中
-                pass
+        # 2. 尝试从 uptime 获取
+        if latency == "未知" and 'uptime' in host_info:
+            uptime_info = host_info['uptime']
+            if 'lastboot' in uptime_info:
+                latency = f"启动: {uptime_info['lastboot']}"
         
-        # 提取开放端口
+        # 提取开放端口 (包含服务版本信息)
         for proto in ['tcp', 'udp']:
             if proto in host_info:
                 for port, port_data in host_info[proto].items():
                     if port_data.get('state') == 'open':
+                        # 构建更详细的服务名
+                        service_name = port_data.get('name', '未知')
+                        product = port_data.get('product', '')
+                        version = port_data.get('version', '')
+                        
+                        if product:
+                            service_name = product
+                            if version:
+                                service_name = f"{product} {version}"
+                        
                         port_info = PortInfo(
                             port=port,
                             protocol=proto,
-                            service=port_data.get('name', '未知'),
+                            service=service_name if service_name else '未知',
                             state=port_data.get('state', 'open')
                         )
                         open_ports.append(port_info)
